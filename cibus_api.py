@@ -3,6 +3,8 @@ import requests
 import json
 
 from additional_data import authorization_url, data_url, app_id, call_types
+from internal_data.creds import user_agent
+
 
 def check_if_work_day():
     return time.strftime("%A") in ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"]
@@ -30,6 +32,11 @@ class CibusApi:
     def __cookies(self):
         return {'token': self.__token}
 
+    def __new_site_cookie(self):
+        return {
+            'new_site': "e0b56031491001d279cc1303da04b0c25540a208a73dcfecfd1f8a90e7897f3b"
+        }
+
     def __post_request(self, url, data):
         return self._session.post(
             url=url,
@@ -48,7 +55,8 @@ class CibusApi:
 
     def generate_header(self):
         return {
-            "application-id": app_id
+            "application-id": app_id,
+            "User-Agent": user_agent
         }
 
     def generate_data_header(self):
@@ -59,16 +67,75 @@ class CibusApi:
             "new_site": self.__new_site
         }
 
-    def get_token(self):  # possible with new capcha?
-        data = {
-            "company": "",
-            "username": self.__username,
-            "password": self.__password
+    def get_token(self, recaptcha_token):
+        auth_url = "https://api.capir.pluxee.co.il/auth/authToken"
+        
+        headers = {
+            "authority": "api.capir.pluxee.co.il",
+            "accept": "application/json, text/plain, */*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "accept-language": "he",
+            "application-id": "E5D5FEF5-A05E-4C64-AEBA-BA0CECA0E402",
+            "origin": "https://consumers.pluxee.co.il",
+            "referer": "https://consumers.pluxee.co.il/",
+            "User-Agent": user_agent,
+            "Content-Type": "application/json; charset=UTF-8"
         }
-        res = self._session.post(url=authorization_url, headers=self.generate_header(), json=data)
-        time.sleep(1)
-        print(res.text)
-        self.__token = json.loads(res.text)["data"]["token"]
+        
+        # Removed method, path, and scheme headers as they might confuse the server
+        
+        data = {
+            "username": self.__username,
+            "password": self.__password,
+            "company": "",
+            "reCAPTCHAToken": recaptcha_token
+        }
+        
+        cookies = self.__new_site_cookie()
+        
+        print(f"Authenticating with username: {self.__username}")
+        print(f"reCAPTCHA token length: {len(recaptcha_token)}")
+        print(f"Token timestamp: {time.strftime('%H:%M:%S')}")
+        print(f"Using cookies: {cookies}")
+        
+        try:
+            res = self._session.post(
+                url=auth_url, 
+                headers=headers, 
+                json=data, 
+                cookies=cookies,
+                timeout=30
+            )
+            
+            print(f"Auth response status: {res.status_code}")
+            print(f"Auth response headers: {dict(res.headers)}")
+            
+            for cookie in res.cookies:
+                print(f"Received cookie: {cookie.name}={cookie.value}")
+                self._session.cookies.set(cookie.name, cookie.value)
+            
+            try:
+                response_data = json.loads(res.text)
+                print(f"Auth response body: {json.dumps(response_data, indent=2)}")
+                
+                if res.status_code == 200:
+                    self.__token = response_data.get("data", {}).get("token")
+                    if not self.__token:
+                        print("Warning: Token field not found in successful response")
+                    else:
+                        print("Successfully obtained authentication token")
+                    return response_data
+                else:
+                    error_msg = response_data.get("error", {}).get("message", "Unknown error")
+                    print(f"Authentication failed: {error_msg}")
+                    return None
+            except json.JSONDecodeError:
+                print(f"Failed to parse auth response: {res.text}")
+                return None
+                
+        except Exception as e:
+            print(f"Exception during authentication request: {str(e)}")
+            return None
 
     def get_new_site_flag(self):
         data = {
@@ -150,6 +217,48 @@ class CibusApi:
             "type": call_types["apply_order"]
         }
 
-        res = self.__post_request(url=data_url, data=data)
-        print(res.content)
-        return res
+        try:
+            print(f"Applying order with token: {self.__token[:10]}...")
+            print(f"Using cookies: {self.__cookies()}")
+            print(f"Headers: {self.generate_data_header()}")
+            
+            res = self.__post_request(url=data_url, data=data)
+            
+            print(f"Apply order response status: {res.status_code}")
+            print(f"Apply order headers: {dict(res.headers)}")
+            
+            try:
+                response_data = json.loads(res.text)
+                print(f"Apply order response: {json.dumps(response_data, indent=2)}")
+                
+                if res.status_code >= 400:
+                    error_msg = response_data.get("error", {}).get("message", "Unknown error")
+                    print(f"Apply order failed: {error_msg}")
+                    
+                    # If unauthorized, token might be expired
+                    if res.status_code == 401:
+                        print("Authentication token appears to be invalid or expired")
+                        return {"status": "error", "message": "Authentication failed"}
+                
+                return response_data
+            except json.JSONDecodeError:
+                print(f"Failed to parse apply order response: {res.text}")
+                return {"status": "error", "message": "Invalid response format"}
+                
+        except Exception as e:
+            print(f"Error applying order: {str(e)}")
+            return {"status": "error", "message": str(e)}
+
+    def retry_auth_if_needed(self, recaptcha_token=None):
+        from captcha_test import get_captcha_token
+        
+        if not self.__token or not recaptcha_token:
+            recaptcha_token = get_captcha_token()
+        
+        result = self.get_token(recaptcha_token)
+        if not result or not self.__token:
+            print("Authentication retry failed")
+            return False
+            
+        print(f"Authentication retry successful, new token: {self.__token[:10]}...")
+        return True
